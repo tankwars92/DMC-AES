@@ -1,184 +1,158 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import socket
-import time
-import pyaes
-import struct
-import os
-import msvcrt
+import socket, time, pyaes, struct, os, msvcrt, random, hashlib, hmac
 
-HOST = "dmconnect.hoho.ws"
-PORT = 42440
-AES_KEY_SIZE = 32
+SERVER_HOST = "localhost"
+KEY_EXCHANGE_PORT = 42441
 
-class UltraCompactClient:
-    def __init__(self):
-        self.socket = None
-        self.encryption_key = None
-        self.use_encryption = False
-        self.running = True
-        self.last_ping_time = 0
+class C:
+	def __init__(self):
+		self.s = None
+		self.k = None
+		self.m = None
+		self.enc = False
+		self.t = 0
 
-    def encrypt_message(self, message, key):
-        try:
-            iv = os.urandom(16)
-            
-            message_bytes = message.encode('utf-8')
-            padding_length = 16 - (len(message_bytes) % 16)
-            padded_message = message_bytes + chr(padding_length) * padding_length
-            
-            aes = pyaes.AESModeOfOperationCBC(key, iv=iv)
-            
-            encrypted_data = ""
-            for i in range(0, len(padded_message), 16):
-                block = padded_message[i:i+16]
-                encrypted_block = aes.encrypt(block)
-                encrypted_data += encrypted_block
-            
-            return iv + encrypted_data
-        except Exception as e:
-            print "Encryption error: %s" % str(e)
-            return None
+	def enc_msg(self, msg, k):
+		iv = os.urandom(16)
+		b = msg.encode('utf-8')
+		pad = 16 - (len(b) % 16)
+		b += chr(pad) * pad
+		a = pyaes.AESModeOfOperationCBC(k, iv=iv)
+		out = ""
+		for i in range(0, len(b), 16):
+			out += a.encrypt(b[i:i+16])
+		return iv + out
 
-    def decrypt_message(self, encrypted_data, key):
-        try:
-            if len(encrypted_data) < 16:
-                return None
-                
-            iv = encrypted_data[:16]
-            encrypted = encrypted_data[16:]
-            
-            if len(encrypted) % 16 != 0:
-                return None
-            
-            aes = pyaes.AESModeOfOperationCBC(key, iv=iv)
-            
-            decrypted = ""
-            for i in range(0, len(encrypted), 16):
-                block = encrypted[i:i+16]
-                decrypted_block = aes.decrypt(block)
-                decrypted += decrypted_block
-            
-            padding_length = ord(decrypted[-1])
-            if padding_length > 16 or padding_length == 0:
-                return None
-                
-            message_bytes = decrypted[:-padding_length]
-            return message_bytes.decode('utf-8')
-        except Exception as e:
-            print "Decryption error: %s" % str(e)
-            return None
+	def dec_msg(self, data, k):
+		if len(data) < 16:
+			return None
+		iv, enc = data[:16], data[16:]
+		if len(enc) % 16 != 0:
+			return None
+		a = pyaes.AESModeOfOperationCBC(k, iv=iv)
+		out = ""
+		for i in range(0, len(enc), 16):
+			out += a.decrypt(enc[i:i+16])
+		pad = ord(out[-1])
+		if pad == 0 or pad > 16:
+			return None
+		return out[:-pad].decode('utf-8')
 
-    def send_message(self, message):
-        try:
-            if self.use_encryption:
-                encrypted = self.encrypt_message(message, self.encryption_key)
-                if encrypted:
-                    length = struct.pack('>I', len(encrypted))
-                    self.socket.send(length + encrypted)
-                    return True
-            else:
-                self.socket.send((message + '\n').encode('utf-8'))
-                return True
-        except Exception as e:
-            print "Send error: %s" % str(e)
-            return False
+	def send(self, msg):
+		if self.enc:
+			p = self.enc_msg(msg, self.k)
+			if not p:
+				return False
+			if self.m:
+				mac = hmac.new(self.m, p, hashlib.sha256).digest()
+				p += mac
+			self.s.send(struct.pack('>I', len(p)) + p)
+			return True
+		else:
+			self.s.send((msg + '\n').encode('utf-8'))
+			return True
 
-    def receive_message(self):
-        try:
-            if self.use_encryption:
-                self.socket.settimeout(0.1)
-                
-                length_data = self.socket.recv(4)
-                if len(length_data) != 4:
-                    return None
-                
-                length = struct.unpack('>I', length_data)[0]
-                
-                encrypted_data = ''
-                while len(encrypted_data) < length:
-                    chunk = self.socket.recv(length - len(encrypted_data))
-                    if not chunk:
-                        return None
-                    encrypted_data += chunk
-                
-                return self.decrypt_message(encrypted_data, self.encryption_key)
-            else:
-                data = self.socket.recv(1024).decode('utf-8').strip()
-                return data if data else None
-        except socket.timeout:
-            return None
-        except Exception as e:
-            print "Receive error: %s" % str(e)
-            return None
+	def recv(self):
+		if self.enc:
+			try:
+				self.s.settimeout(0.1)
+				d = self.s.recv(4)
+			except socket.timeout:
+				return None
+			if len(d) != 4:
+				return None
+			ln = struct.unpack('>I', d)[0]
+			buf = ""
+			while len(buf) < ln:
+				try:
+					c = self.s.recv(ln - len(buf))
+				except socket.timeout:
+					return None
+				if not c:
+					return None
+				buf += c
+			if self.m and ln >= 32:
+				data_part, mac_part = buf[:-32], buf[-32:]
+				exp = hmac.new(self.m, data_part, hashlib.sha256).digest()
+				if exp != mac_part:
+					return None
+				payload = data_part
+			else:
+				payload = buf
+			return self.dec_msg(payload, self.k)
+		else:
+			data = self.s.recv(1024).decode('utf-8').strip()
+			return data if data else None
 
-    def connect(self):
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((HOST, PORT))
-            
-            self.encryption_key = self.socket.recv(AES_KEY_SIZE)
-            if len(self.encryption_key) == AES_KEY_SIZE:
-                self.use_encryption = True
+	def connect(self):
+		try:
+			self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			self.s.connect((SERVER_HOST, KEY_EXCHANGE_PORT))
+			d = self.s.recv(2)
+			if len(d) != 2:
+				return False
+			alen = struct.unpack('>H', d)[0]
+			Ab = ""
+			while len(Ab) < alen:
+				c = self.s.recv(alen - len(Ab))
+				if not c:
+					return False
+				Ab += c
+			P = int("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" "29024E088A67CC74020BBEA63B139B22514A08798E3404DD" "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245" "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16)
+			G = 2
+			A = int(Ab.encode('hex'), 16)
+			b = random.getrandbits(256)
+			B = pow(G, b, P)
+			Bh = hex(B)[2:].rstrip('L')
+			if len(Bh) % 2:
+				Bh = '0' + Bh
+			Bb = Bh.decode('hex')
+			self.s.send(struct.pack('>H', len(Bb)) + Bb)
+			S = pow(A, b, P)
+			Sh = hex(S)[2:].rstrip('L')
+			if len(Sh) % 2:
+				Sh = '0' + Sh
+			Sb = Sh.decode('hex')
+			self.k = hashlib.sha256(Sb + "|KEY").digest()
+			self.m = hashlib.sha256(Sb + "|MAC").digest()
+			self.enc = True
+			msg = self.recv()
+			if msg:
+				print msg
+			return True
+		except Exception:
+			return False
 
-                message = self.receive_message()
-                if message:
-                    print message
-                
-                return True
-            else:
-                print "Failed to get encryption key."
-                return False
-        except Exception as e:
-            print "Connection failed: %s" % str(e)
-            return False
-
-    def check_for_messages(self):
-        try:
-            message = self.receive_message()
-            if message:
-                if message.strip() != "*Ping!*":
-                    print message
-                return True
-
-            return True
-        except Exception as e:
-            print "Receiver error: %s" % str(e)
-            return False
-
-    def run(self):
-        if not self.connect():
-            return
-        
-        try:
-            while self.running:
-                current_time = time.time()
-                
-                if current_time - self.last_ping_time > 5:
-                    self.send_message("/")
-                    self.last_ping_time = current_time
-                
-                if msvcrt.kbhit():
-                    try:
-                        message = raw_input()
-                        if message.lower() in ['/quit', '/exit']:
-                            break
-                        if not self.send_message(message):
-                            break
-                    except EOFError:
-                        break
-                
-                self.check_for_messages()
-                time.sleep(0.01)
-                        
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.running = False
-            if self.socket:
-                self.socket.close()
-            print "Disconnected."
+	def loop(self):
+		if not self.connect():
+			return
+		try:
+			while True:
+				now = time.time()
+				if now - self.t > 5:
+					self.send("/")
+					self.t = now
+				if msvcrt.kbhit():
+					try:
+						m = raw_input()
+						if m.lower() in ['/quit', '/exit']:
+							break
+						if not self.send(m):
+							break
+					except EOFError:
+						break
+				r = self.recv()
+				if r and r.strip() != "*Ping!*":
+					print r
+				time.sleep(0.01)
+		except KeyboardInterrupt:
+			pass
+		finally:
+			try:
+				self.s.close()
+			except:
+				pass
 
 if __name__ == "__main__":
-    client = UltraCompactClient()
-    client.run()
+	C().loop()
